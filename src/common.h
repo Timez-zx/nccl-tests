@@ -73,6 +73,14 @@ typedef enum {
   testNumResults = 6
 } testResult_t;
 
+// NVLink failure simulation globals and functions
+extern int nvlinkFailureIteration;
+extern bool nvlinkFailureInjected;
+extern int* originalP2PMatrix;
+extern long long nvlinkFailureMinBytes; // Inject when message size >= this threshold (-1 disables)
+extern testResult_t checkP2PConnectivity(int nGpus, int* gpus);
+extern testResult_t injectNVLinkFailure(ncclComm_t* comms, int nGpus, int* gpus);
+
 // Relay errors up and trace
 #define TESTCHECK(cmd) do {                         \
   testResult_t r = cmd;                             \

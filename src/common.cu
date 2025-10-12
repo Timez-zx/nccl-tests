@@ -17,6 +17,12 @@
 
 #include "../verifiable/verifiable.h"
 
+// Runtime NVLink failure simulation globals
+int nvlinkFailureIteration = -1;  // Which iteration to inject failure (-1 = disabled)
+bool nvlinkFailureInjected = false;
+int* originalP2PMatrix = nullptr;  // Store original P2P connectivity
+long long nvlinkFailureMinBytes = -1; // Inject when current message size >= this threshold (-1 = disabled)
+
 #pragma weak ncclCommWindowRegister
 #pragma weak ncclCommWindowDeregister
 #pragma weak ncclDevCommCreate
@@ -162,6 +168,60 @@ testResult_t InitDataReduce(void* data, const size_t count, const size_t offset,
 
 testResult_t InitData(void* data, const size_t count, size_t offset, ncclDataType_t type, ncclRedOp_t op, uint64_t seed, int nranks, int rank) {
   CUDACHECK(ncclVerifiablePrepareInput(data, count, (int)type, (int)op, nranks, rank, seed, offset, cudaStreamDefault));
+  return testSuccess;
+}
+
+// Function to check current P2P connectivity status
+testResult_t checkP2PConnectivity(int nGpus, int* gpus) {
+  printf("[P2P Status Check] Checking P2P connectivity between GPUs...\n");
+  int totalConnections = 0;
+  int activeConnections = 0;
+  
+  for (int i = 0; i < nGpus; i++) {
+    CUDACHECK(cudaSetDevice(gpus[i]));
+    for (int j = 0; j < nGpus; j++) {
+      if (i != j) {
+        totalConnections++;
+        int canAccess = 0;
+        CUDACHECK(cudaDeviceCanAccessPeer(&canAccess, gpus[i], gpus[j]));
+        if (canAccess) {
+          activeConnections++;
+          printf("[P2P Status] GPU %d -> GPU %d: HARDWARE_CAPABLE\n", gpus[i], gpus[j]);
+        } else {
+          printf("[P2P Status] GPU %d -> GPU %d: DISABLED (Hardware)\n", gpus[i], gpus[j]);
+        }
+      }
+    }
+  }
+  
+  printf("[P2P Status Check] Active connections: %d/%d (%.1f%%)\n", 
+         activeConnections, totalConnections, 
+         100.0 * activeConnections / totalConnections);
+  return testSuccess;
+}
+
+// Function to simulate runtime NVLink failure
+testResult_t injectNVLinkFailure(ncclComm_t* comms, int nGpus, int* gpus) {
+  if (nvlinkFailureInjected) return testSuccess;
+
+  printf("[NVLink Failure Simulation] Injecting failure by aborting communicators...\n");
+
+  // Abort all communicators to simulate a runtime link failure mid-collective
+  // This matches the realistic flow: current call fails, then app must rebuild.
+  for (int i = 0; i < nGpus; i++) {
+    if (comms && comms[i]) {
+      ncclResult_t r = ncclCommAbort(comms[i]);
+      if (r != ncclSuccess) {
+        printf("[NVLink Failure] Warning: ncclCommAbort failed on GPU %d: %s\n", gpus[i], ncclGetErrorString(r));
+      } else {
+        printf("[NVLink Failure] Aborted NCCL communicator on GPU %d\n", gpus[i]);
+      }
+    }
+  }
+
+  nvlinkFailureInjected = true;
+  printf("[NVLink Failure Simulation] Communicators aborted. Subsequent NCCL calls should report errors or async error.\n");
+
   return testSuccess;
 }
 
@@ -483,6 +543,18 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   // Performance Benchmark
   timer tim;
   for (int iter = 0; iter < iters; iter++) {
+    // Size-based trigger takes precedence if configured
+    if (!nvlinkFailureInjected && nvlinkFailureMinBytes >= 0 && (long long)args->nbytes >= nvlinkFailureMinBytes) {
+      printf("[NVLink Failure Simulation] Injecting failure due to size threshold: current=%zu bytes, threshold=%lld bytes\n", args->nbytes, nvlinkFailureMinBytes);
+      TESTCHECK(injectNVLinkFailure(args->comms, args->nGpus, args->gpus));
+      usleep(100000);
+    } else if (nvlinkFailureIteration >= 0 && iter == nvlinkFailureIteration && !nvlinkFailureInjected) {
+      // Fallback to iteration-based trigger
+      printf("[NVLink Failure Simulation] Injecting failure at iteration %d/%d\n", iter, iters);
+      TESTCHECK(injectNVLinkFailure(args->comms, args->nGpus, args->gpus));
+      usleep(100000);
+    }
+    
     if (agg_iters>1) NCCLCHECK(ncclGroupStart());
     for (int aiter = 0; aiter < agg_iters; aiter++) {
       TESTCHECK(startColl(args, type, op, root, in_place, iter*agg_iters+aiter));

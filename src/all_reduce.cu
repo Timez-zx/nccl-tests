@@ -31,6 +31,8 @@
 constexpr int WARP_SIZE = 32;
 #endif
 
+// Runtime NVLink failure simulation globals (moved to common.cu)
+
 void AllReduceGetCollByteCount(size_t *sendcount, size_t *recvcount, size_t *paramcount, size_t *sendInplaceOffset, size_t *recvInplaceOffset, size_t count, size_t eltSize, int nranks) {
   *sendcount = count;
   *recvcount = count;
@@ -43,6 +45,20 @@ testResult_t AllReduceInitData(struct threadArgs* args, ncclDataType_t type, ncc
   size_t sendcount = args->sendBytes / wordSize(type);
   size_t recvcount = args->expectedBytes / wordSize(type);
   int nranks = args->nProcs*args->nThreads*args->nGpus;
+
+  // Initialize NVLink failure simulation parameters
+  const char* failureIterEnv = getenv("NCCL_NVLINK_FAILURE_ITERATION");
+  if (failureIterEnv) {
+    nvlinkFailureIteration = atoi(failureIterEnv);
+    printf("[NVLink Failure Simulation] Will inject failure at iteration %d\n", nvlinkFailureIteration);
+  }
+  const char* failureMinBytesEnv = getenv("NCCL_NVLINK_FAILURE_MIN_BYTES");
+  if (failureMinBytesEnv) {
+    nvlinkFailureMinBytes = atoll(failureMinBytesEnv);
+    // if (nvlinkFailureMinBytes >= 0) {
+    //   printf("[NVLink Failure Simulation] Will inject failure when message size >= %lld bytes\n", nvlinkFailureMinBytes);
+    // }
+  }
 
   for (int i=0; i<args->nGpus; i++) {
     CUDACHECK(cudaSetDevice(args->gpus[i]));
@@ -441,31 +457,74 @@ __global__ void allReduceMultimemVectorizedKernel(ncclWindow_t sendwin, size_t s
 }
 #endif
 
+// NVLink failure simulation functions moved to common.cu
+
 testResult_t AllReduceRunColl(void* sendbuff, size_t sendoffset, void* recvbuff, size_t recvoffset, size_t count, ncclDataType_t type, ncclRedOp_t op, int root, ncclComm_t comm, cudaStream_t stream, int deviceImpl) {
 
   char* sptr = (char*)sendbuff + sendoffset;
   char* rptr = (char*)recvbuff + recvoffset;
 
+  // Monitor NCCL error handling during runtime failures
+  if (nvlinkFailureInjected) {
+    printf("[NVLink Failure Monitor] Running AllReduce with deviceImpl=%d after failure injection\n", deviceImpl);
+  }
+
   switch (deviceImpl) {
   case 0:
-    NCCLCHECK(ncclAllReduce(sptr, rptr, count, type, op, comm, stream));
+    {
+      ncclResult_t result = ncclAllReduce(sptr, rptr, count, type, op, comm, stream);
+      if (result != ncclSuccess) {
+        printf("[NVLink Failure Monitor] NCCL AllReduce failed: %s\n", ncclGetErrorString(result));
+        if (nvlinkFailureInjected) {
+          printf("[NVLink Failure Monitor] This failure occurred after NVLink failure injection\n");
+        }
+        return testNcclError;
+      }
+      if (nvlinkFailureInjected) {
+        printf("[NVLink Failure Monitor] NCCL AllReduce succeeded despite NVLink failure - NCCL handled gracefully\n");
+      }
+    }
     return testSuccess;
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
   case 1:
+    if (nvlinkFailureInjected) {
+      printf("[NVLink Failure Monitor] Attempting LSA kernel after P2P failure - may fail\n");
+    }
     TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(allReduceLsaKernel, type, op),
                sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, 0));
+    if (nvlinkFailureInjected) {
+      printf("[NVLink Failure Monitor] LSA kernel completed despite P2P failure\n");
+    }
     return testSuccess;
   case 2:
+    if (nvlinkFailureInjected) {
+      printf("[NVLink Failure Monitor] Attempting vectorized LSA kernel after P2P failure - may fail\n");
+    }
     TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(allReduceLsaVectorizedKernel, type, op),
                sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, 0));
+    if (nvlinkFailureInjected) {
+      printf("[NVLink Failure Monitor] Vectorized LSA kernel completed despite P2P failure\n");
+    }
     return testSuccess;
   case 3:
+    if (nvlinkFailureInjected) {
+      printf("[NVLink Failure Monitor] Attempting multimem kernel after P2P failure - may fail\n");
+    }
     TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(allReduceMultimemKernel, type, op),
                sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, 1));
+    if (nvlinkFailureInjected) {
+      printf("[NVLink Failure Monitor] Multimem kernel completed despite P2P failure\n");
+    }
     return testSuccess;
   case 4:
+    if (nvlinkFailureInjected) {
+      printf("[NVLink Failure Monitor] Attempting vectorized multimem kernel after P2P failure - may fail\n");
+    }
     TESTCHECK(testLaunchDeviceKernel(SPECIALIZE_KERNEL(allReduceMultimemVectorizedKernel, type, op),
                sendbuff, sendoffset, recvbuff, recvoffset, count, type, op, root, comm, stream, 1));
+    if (nvlinkFailureInjected) {
+      printf("[NVLink Failure Monitor] Vectorized multimem kernel completed despite P2P failure\n");
+    }
     return testSuccess;
 #endif
   }
