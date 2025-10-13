@@ -2,7 +2,7 @@
   <cpu numaid="0" affinity="55555555,55555555" arch="x86_64" vendor="GenuineIntel" familyid="6" modelid="106">
     <pci busid="0000:17:00.0" class="0x030200" vendor="0x10de" device="0x20b5" subsystem_vendor="0x10de" subsystem_device="0x1533" link_speed="16.0 GT/s PCIe" link_width="16">
       <gpu dev="0" sm="80" rank="0" gdr="1">
-        <nvlink target="0000:65:00.0" count="12" tclass="0x030200"/>
+        <nvlink target="0000:65:00.0" count="1" tclass="0x030200"/>
       </gpu>
     </pci>
     <pci busid="0000:4b:00.0" class="0x020000" vendor="0x15b3" device="0x101d" subsystem_vendor="0x15b3" subsystem_device="0x0058" link_speed="16.0 GT/s PCIe" link_width="16">
