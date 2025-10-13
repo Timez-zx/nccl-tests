@@ -49,6 +49,8 @@ unset NCCL_TOPO_FILE
 export NCCL_TOPO_FILE=$PWD/topo_fail.xml
 ./build/all_reduce_perf -b 8M -e 8G -f 2 -g 8
 
+NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=ALL NCCL_TOPO_DUMP_FILE=nccl_topo_dump.xml ./build/all_reduce_perf -b 8M -e 8G -f 2 -g 2
+
 sudo systemctl stop nvidia-fabricmanager
 
 sudo systemctl start nvidia-fabricmanager
