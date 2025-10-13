@@ -28,6 +28,9 @@ sudo apt update
 sudo apt -y install libnccl2 libnccl-dev
 dpkg -l | grep nccl
 
+sudo apt -y update
+sudo apt -y install openmpi-bin libopenmpi-dev
+
 git clone https://github.com/NVIDIA/nccl-tests.git
 cd nccl-tests
 make -j"$(nproc)" MPI=0 CUDA_HOME=/usr/local/cuda
@@ -52,3 +55,24 @@ sudo systemctl start nvidia-fabricmanager
 
 # Test CUDA failure common.cu:154 'unspecified launch failure'
 # Test failure all_reduce.cu:518
+
+cat <<'EOF' >> ~/.bashrc
+if [ -d /usr/lib/x86_64-linux-gnu/openmpi ]; then
+  export MPI_HOME=/usr/lib/x86_64-linux-gnu/openmpi
+  export PATH=$PATH:$MPI_HOME/bin
+  export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$MPI_HOME/lib
+  export CPATH=${CPATH:+$CPATH:}$MPI_HOME/include
+  export LIBRARY_PATH=${LIBRARY_PATH:+$LIBRARY_PATH:}$MPI_HOME/lib
+fi
+EOF
+
+make -j"$(nproc)" MPI=1 CUDA_HOME=/usr/local/cuda
+
+ssh-copy-id zx@192.168.11.11
+ssh-copy-id zx@192.168.11.10
+
+mpirun -np 4 -H 192.168.11.10:2,192.168.11.11:2 --bind-to none --map-by ppr:2:node --mca oob_tcp_if_include enp75s0f1np1 --mca btl_tcp_if_include enp75s0f1np1 -x PATH -x LD_LIBRARY_PATH -x NCCL_DEBUG=INFO -x NCCL_DEBUG_SUBSYS=INIT,BOOTSTRAP,NET -x NCCL_SOCKET_IFNAME=enp75s0f1np1 -x NCCL_IB_HCA=mlx5_1 -x NCCL_CROSS_NIC=1 ./build/all_reduce_perf -b 8M -e 4G -f 2 -g 1
+
+mpirun -np 4 -H 192.168.11.10:2,192.168.11.11:2 --bind-to none --map-by ppr:2:node --mca oob_tcp_if_include enp75s0f1np1 --mca btl_tcp_if_include enp75s0f1np1 -x PATH -x LD_LIBRARY_PATH -x NCCL_DEBUG=INFO -x NCCL_DEBUG_SUBSYS=INIT,NET -x NCCL_SOCKET_IFNAME=enp75s0f1np1 -x NCCL_CROSS_NIC=1 -x NCCL_IB_HCA=mlx5_0,mlx5_1 -x NCCL_NET_GDR_LEVEL=5 ./build/all_reduce_perf -b 8M -e 4G -f 2 -g 1
+
+# To be continued: Multi-rail test
