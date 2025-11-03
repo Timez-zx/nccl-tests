@@ -378,9 +378,15 @@ testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t*
        continue;
      }
 
-     if (cudaErr != cudaErrorNotReady) CUDACHECK(cudaErr);
+     // EXPERIMENT: Comment out immediate error checking to simulate real inference
+     // Real inference doesn't check errors on every poll, only at explicit sync points
+     // This will let the program hang if a GPU crashes, showing realistic behavior
+     // if (cudaErr != cudaErrorNotReady) CUDACHECK(cudaErr);
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,4,0)
+     // EXPERIMENT: Comment out active error handling to simulate real inference behavior
+     // In real inference, there's usually no active polling of NCCL async errors or timeout abort
+     /*
      if (test_ncclVersion >= NCCL_VERSION(2,4,0) && comms) {
        ncclResult_t ncclAsyncErr;
        NCCLCHECK(ncclCommGetAsyncError(comms[i], &ncclAsyncErr));
@@ -406,6 +412,7 @@ testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t*
        free(done);
        return testTimeout;
      }
+     */
 #endif
    }
 
@@ -418,6 +425,11 @@ testResult_t testStreamSynchronize(int ngpus, cudaStream_t* streams, ncclComm_t*
 
 testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t opIndex, int root, int in_place, int iter) {
   size_t count = args->nbytes / wordSize(type);
+
+  // EXPERIMENT Level 2: Track when AllReduce kernels are launched from host
+  int rank0 = args->proc*args->nThreads*args->nGpus + args->thread*args->nGpus;
+  printf("[HOST LAUNCH] Starting AllReduce #%d, size=%zu bytes, rank_base=%d\n",
+         iter, args->nbytes, rank0);
 
   // Try to change offset for each iteration so that we avoid cache effects and catch race conditions in ptrExchange
   size_t totalnbytes = max(args->sendBytes, args->expectedBytes);
@@ -497,6 +509,10 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
   if (args->nGpus > 1) NCCLCHECK(ncclGroupEnd());
 
+  // EXPERIMENT Level 2: Track when AllReduce kernel has been queued (async)
+  printf("[HOST QUEUED] AllReduce #%d queued to stream (async), rank_base=%d\n",
+         iter, rank0);
+
   if (blocking_coll) {
     // Complete op before returning
     TESTCHECK(testStreamSynchronize(args->nGpus, args->streams, args->comms));
@@ -519,9 +535,15 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
     TESTCHECK(args->collTest->initData(args, type, op, root, 99, in_place));
   }
 
-  // Sync
-  TESTCHECK(startColl(args, type, op, root, in_place, 0));
-  TESTCHECK(completeColl(args));
+  // Sync (Warmup)
+  // EXPERIMENT: Skip warmup for large sizes to see continuous kernel queuing
+  if (args->nbytes < 128*1024*1024) {
+    printf("[WARMUP] Running warmup for size=%zu bytes\n", args->nbytes);
+    TESTCHECK(startColl(args, type, op, root, in_place, 0));
+    TESTCHECK(completeColl(args));
+  } else {
+    printf("[WARMUP] SKIPPED for size=%zu bytes - will go directly to 20 iterations\n", args->nbytes);
+  }
 
   Barrier(args);
 
@@ -541,6 +563,15 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 #endif
 
   // Performance Benchmark
+  // EXPERIMENT Level 3: Create CUDA Events to track each kernel's status
+  cudaEvent_t events[args->nGpus][25];  // Support up to 25 iterations per GPU
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    for (int iter = 0; iter < iters; iter++) {
+      CUDACHECK(cudaEventCreate(&events[i][iter]));
+    }
+  }
+
   timer tim;
   for (int iter = 0; iter < iters; iter++) {
     // Size-based trigger takes precedence if configured
@@ -554,12 +585,43 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
       TESTCHECK(injectNVLinkFailure(args->comms, args->nGpus, args->gpus));
       usleep(100000);
     }
-    
+
     if (agg_iters>1) NCCLCHECK(ncclGroupStart());
     for (int aiter = 0; aiter < agg_iters; aiter++) {
       TESTCHECK(startColl(args, type, op, root, in_place, iter*agg_iters+aiter));
     }
     if (agg_iters>1) NCCLCHECK(ncclGroupEnd());
+
+    // EXPERIMENT Level 3: Record event after each AllReduce is queued
+    for (int i = 0; i < args->nGpus; i++) {
+      CUDACHECK(cudaSetDevice(args->gpus[i]));
+      CUDACHECK(cudaEventRecord(events[i][iter], args->streams[i]));
+    }
+  }
+
+  // EXPERIMENT Level 3: Query all events immediately after all kernels are queued
+  printf("\n[EVENT QUERY] Checking kernel status IMMEDIATELY after queuing (size=%zu):\n", args->nbytes);
+  printf("[EVENT QUERY] (GPU has NOT started executing yet, all should be PENDING)\n");
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    printf("[EVENT QUERY] GPU %d (Rank %d) stream status:\n", args->gpus[i], i);
+    for (int iter = 0; iter < iters; iter++) {
+      cudaError_t status = cudaEventQuery(events[i][iter]);
+      const char* status_str;
+      if (status == cudaSuccess) {
+        status_str = "COMPLETED";
+      } else if (status == cudaErrorNotReady) {
+        status_str = "PENDING (queued or running)";
+      } else {
+        status_str = cudaGetErrorString(status);
+      }
+      printf("  [EVENT] AllReduce #%d: %s\n", iter, status_str);
+      if (iter >= 4 && iter < iters - 2) {
+        // Skip middle events to reduce output
+        if (iter == 4) printf("  ... (skipping middle events) ...\n");
+        continue;
+      }
+    }
   }
 
 #if CUDART_VERSION >= 11030
@@ -584,6 +646,45 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 #endif
 
   double cputimeSec = tim.elapsed()/(iters*agg_iters);
+
+  // EXPERIMENT Level 3: Wait for GPU to execute and crash
+  // Give GPU time to start executing and hit the fault injection point
+  printf("\n[WAITING] Sleeping for 2 seconds to let GPU execute and crash...\n");
+  sleep(2);
+  printf("[WAITING] Done sleeping. Now checking kernel status after crash should have occurred.\n");
+
+  // EXPERIMENT Level 3: Query events after crash should have occurred
+  printf("\n[EVENT QUERY] Checking kernel status AFTER crash (2 seconds after queuing):\n");
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    printf("[EVENT QUERY] GPU %d (Rank %d) stream status:\n", args->gpus[i], i);
+    for (int iter = 0; iter < iters; iter++) {
+      cudaError_t status = cudaEventQuery(events[i][iter]);
+      const char* status_str;
+      if (status == cudaSuccess) {
+        status_str = "COMPLETED";
+      } else if (status == cudaErrorNotReady) {
+        status_str = "PENDING (queued or running)";
+      } else {
+        status_str = cudaGetErrorString(status);
+      }
+      printf("  [EVENT] AllReduce #%d: %s\n", iter, status_str);
+      if (iter >= 4 && iter < iters - 2) {
+        if (iter == 4) printf("  ... (skipping middle events) ...\n");
+        continue;
+      }
+    }
+  }
+
+  // Destroy events
+  // EXPERIMENT: Don't check errors to avoid early exit
+  for (int i = 0; i < args->nGpus; i++) {
+    cudaSetDevice(args->gpus[i]);
+    for (int iter = 0; iter < iters; iter++) {
+      cudaEventDestroy(events[i][iter]);  // Ignore errors
+    }
+  }
+
   TESTCHECK(completeColl(args));
 
   double deltaSec = tim.elapsed();
@@ -703,12 +804,18 @@ testResult_t TimeTest(struct threadArgs* args, ncclDataType_t type, const char* 
   Barrier(args);
 
   // Warm-up for all sizes (using a stepfactor of 2)
+  // EXPERIMENT: Skip warmup for sizes >= 128M to see continuous kernel queuing
   for (size_t size = args->minbytes; size <= args->maxbytes; size = size * 2) {
     setupArgs(size, type, args);
-    for (int iter = 0; iter < warmup_iters; iter++) {
-      TESTCHECK(startColl(args, type, op, root, 0, iter));
+    if (size < 128*1024*1024) {
+      printf("[WARMUP-TimeTest] Running warmup for size=%zu bytes\n", size);
+      for (int iter = 0; iter < warmup_iters; iter++) {
+        TESTCHECK(startColl(args, type, op, root, 0, iter));
+      }
+      TESTCHECK(completeColl(args));
+    } else {
+      printf("[WARMUP-TimeTest] SKIPPED for size=%zu bytes - will see continuous queuing\n", size);
     }
-    TESTCHECK(completeColl(args));
   }
 
   // Benchmark

@@ -214,3 +214,9 @@ Future enhancements could include:
 - Network failure simulation (InfiniBand interruption)
 - Automatic failure detection and reporting
 - Performance regression analysis
+
+make clean && NCCL_HOME=/home/zx/nccl/build make -j$(nproc)
+
+LD_LIBRARY_PATH=/home/zx/nccl/build/lib:$LD_LIBRARY_PATH ./build/all_reduce_perf -b 32M -e 512M -f 2 -g 2
+
+NCCL_DEBUG=TRACE NCCL_DEBUG_SUBSYS=ALL LD_LIBRARY_PATH=/home/zx/nccl/build/lib:$LD_LIBRARY_PATH ./build/all_reduce_perf -b 32M -e 512M -f 2 -g 2 2>&1 | tee nccl_debug.log
