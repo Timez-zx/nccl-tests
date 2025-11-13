@@ -311,6 +311,60 @@ void Allreduce(struct threadArgs* args, T* value, int average) {
   epoch ^= 1;
 }
 
+// Simple kernel to test memory access
+__global__ void testMemoryAccessKernel(void* ptr, size_t size, int* result) {
+  int tid = threadIdx.x + blockIdx.x * blockDim.x;
+  volatile int* data = (volatile int*)ptr;
+
+  // Try to read from memory
+  if (tid == 0) {
+    int sum = 0;
+    for (size_t i = 0; i < size / sizeof(int); i += 1024) {
+      sum += data[i];
+    }
+    *result = sum;
+  }
+}
+
+// Function to check if GPU memory is accessible
+testResult_t checkMemoryAccess(void* ptr, size_t size, int gpu, const char* label) {
+  cudaError_t err;
+
+  // Allocate result buffer
+  int* d_result;
+  err = cudaMalloc(&d_result, sizeof(int));
+  if (err != cudaSuccess) {
+    printf("[MEM CHECK] %s GPU %d: cudaMalloc failed - %s\n",
+           label, gpu, cudaGetErrorString(err));
+    return testCudaError;
+  }
+
+  // Launch kernel to test memory access
+  testMemoryAccessKernel<<<1, 32>>>(ptr, size, d_result);
+
+  // Check if kernel launched successfully
+  err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    printf("[MEM CHECK] %s GPU %d: Kernel launch failed - %s\n",
+           label, gpu, cudaGetErrorString(err));
+    cudaFree(d_result);
+    return testCudaError;
+  }
+
+  // Try to synchronize
+  err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    printf("[MEM CHECK] %s GPU %d: Memory ACCESS FAILED - %s\n",
+           label, gpu, cudaGetErrorString(err));
+    cudaFree(d_result);
+    return testCudaError;
+  }
+
+  printf("[MEM CHECK] %s GPU %d: Memory accessible (OK)\n", label, gpu);
+  cudaFree(d_result);
+  return testSuccess;
+}
+
 testResult_t CheckData(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place, int64_t *wrongElts) {
   int nranks = args->nProcs*args->nGpus*args->nThreads;
   size_t count = args->expectedBytes/wordSize(type);
@@ -530,6 +584,39 @@ testResult_t completeColl(struct threadArgs* args) {
 
 testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t op, int root, int in_place) {
   size_t count = args->nbytes / wordSize(type);
+
+  // Allocate test memory on each GPU before AllReduce
+  const size_t testMemSize = 256 * 1024 * 1024; // 256 MB test memory
+  void* testMemPtrs[args->nGpus];
+  printf("\n[TEST MEMORY] Allocating %zu MB test memory on each GPU before AllReduce\n",
+         testMemSize / (1024*1024));
+
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    cudaError_t err = cudaMalloc(&testMemPtrs[i], testMemSize);
+    if (err != cudaSuccess) {
+      printf("[TEST MEMORY] GPU %d: Allocation failed - %s\n",
+             args->gpus[i], cudaGetErrorString(err));
+      // Free previously allocated memory
+      for (int j = 0; j < i; j++) {
+        cudaSetDevice(args->gpus[j]);
+        cudaFree(testMemPtrs[j]);
+      }
+      return testCudaError;
+    }
+    // Initialize the memory
+    cudaMemset(testMemPtrs[i], 0xAB, testMemSize);
+    printf("[TEST MEMORY] GPU %d: Successfully allocated and initialized test memory at %p\n",
+           args->gpus[i], testMemPtrs[i]);
+  }
+
+  // Check initial memory access before AllReduce
+  printf("\n[TEST MEMORY] Checking initial memory access BEFORE AllReduce:\n");
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    TESTCHECK(checkMemoryAccess(testMemPtrs[i], testMemSize, args->gpus[i], "BEFORE"));
+  }
+
   if (datacheck) {
     // Initialize sendbuffs, recvbuffs and expected
     TESTCHECK(args->collTest->initData(args, type, op, root, 99, in_place));
@@ -624,6 +711,13 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
     }
   }
 
+  // Check test memory access immediately after queuing
+  printf("\n[TEST MEMORY] Checking memory access IMMEDIATELY after queuing:\n");
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    checkMemoryAccess(testMemPtrs[i], testMemSize, args->gpus[i], "IMMEDIATE");
+  }
+
 #if CUDART_VERSION >= 11030
   if (cudaGraphLaunches >= 1) {
     // End cuda graph capture
@@ -674,6 +768,13 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
         continue;
       }
     }
+  }
+
+  // Check test memory access after crash should have occurred
+  printf("\n[TEST MEMORY] Checking memory access AFTER crash (2 seconds after queuing):\n");
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    checkMemoryAccess(testMemPtrs[i], testMemSize, args->gpus[i], "AFTER_CRASH");
   }
 
   // Destroy events
@@ -782,6 +883,15 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 
   args->bw[0] += busBw;
   args->bw_count[0]++;
+
+  // Free test memory at the end
+  printf("\n[TEST MEMORY] Freeing test memory on all GPUs\n");
+  for (int i = 0; i < args->nGpus; i++) {
+    CUDACHECK(cudaSetDevice(args->gpus[i]));
+    cudaFree(testMemPtrs[i]);
+    printf("[TEST MEMORY] GPU %d: Test memory freed\n", args->gpus[i]);
+  }
+
   return testSuccess;
 }
 
