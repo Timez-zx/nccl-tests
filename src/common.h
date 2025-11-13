@@ -158,6 +158,10 @@ struct threadArgs {
 
   struct testColl* collTest;
 
+  // Test memory for continuous access checking
+  void** testMemPtrs;
+  size_t testMemSize;
+
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,19,0)
   void** sendRegHandles;
   void** recvRegHandles;
